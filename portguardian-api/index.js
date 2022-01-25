@@ -30,6 +30,7 @@ var connLimitController = {
 //--------------------------------
 
 var pgdbObj = {}
+var windowtimer={}
 var iptables = { 
     clearIP: (ip=null) => {
         try {
@@ -42,7 +43,7 @@ var iptables = {
 
             }
         } catch (e) {
-            console.log("iptables: no previous rules "+ip?("for " + ip):"")
+            console.log("iptables: no previous rules "+((ip)?("for " + ip):""))
         }
     },
     clearAll: () => {
@@ -66,6 +67,9 @@ setInterval(() => {
 }, connLimitController.checkInterval * 1000)
 
 var server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', "*");
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, PUT, DELETE, OPTIONS');
+
     req.on('data', (chunk) => {
         let ip = getRemoteIP(req).replace("::ffff:", "")
         if (typeof connLimitController.map[ip] == 'undefined') {
@@ -128,7 +132,8 @@ var server = http.createServer((req, res) => {
                                 pgdbObj.users[account].authTime = Date.now()
                                 dbOp.save()
                                 iptables.allowIP(ip)
-                                setTimeout(() => {
+                                clearInterval(windowtimer[account])
+                                windowtimer[account]=setTimeout(() => {
                                     iptables.dropIPNew(ip)
                                     console.log("closed new connection for " + ip)
                                     pgdbObj.users[account].portstate = {
@@ -164,10 +169,15 @@ var server = http.createServer((req, res) => {
                         break
                     case "modpass":
                         {
+                            let passwordHash = obj.body.code
+                            let passwordHashNew = obj.body.codenew
+                            if(!passwordHashNew){
+                                responser.errorEmitter.invalidJSONSyntax(res, 3)
+                                return
+                            }
                             validTokenAndAction(token, account, ip, res, () => {
 
-                                let passwordHash = obj.body.code
-                                let passwordHashNew = obj.body.codenew
+                                
 
                                 try {
                                     if (pgdbObj.users[account].passwordHash != passwordHash) {
@@ -188,6 +198,7 @@ var server = http.createServer((req, res) => {
                     case "portunauth":
                         {
                             validTokenAndAction(token, account, ip, res, () => {
+                                clearInterval(windowtimer[account])
                                 iptables.clearIP(ip)
                                 pgdbObj.users[account].portstate = {
                                     state: "unauth",
@@ -195,6 +206,17 @@ var server = http.createServer((req, res) => {
                                 }
                                 dbOp.save()
                                 responser.reponseJSON(res, { result: "ok" })
+                            })
+                        }
+                        break
+                    case "userstat":
+                        {
+                            validTokenAndAction(token, account, ip, res, () => {
+                                responser.reponseJSON(res,{
+                                    account: account,
+                                    portstate: pgdbObj.users[account].portstate,
+                                    time: Date.now()
+                                })
                             })
                         }
                         break
@@ -383,3 +405,8 @@ console.log("Listening on port " + servicePort)
 
 iptables.clearAll()
 iptables.dropAll()
+
+process.on('uncaughtException', function(err){
+    console.error(" * BUG: "+err.stack)
+    fs.appendFileSync("bugs.log",new Date().toString()+" "+err.stack.toString()+"\n")
+})
