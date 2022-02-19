@@ -1,10 +1,14 @@
-//yum: eccrypto
+/*
+    Portguardian API
+    Version 1.01
+*/
 const http = require('http')
 const net = require('net')
 const fs = require('fs')
 const crypto = require('crypto');
 const eccrypto = require('eccrypto')
 const exec = require('child_process').execSync
+const apiVersion = "1.01"
 
 //--------------------------------
 
@@ -30,11 +34,24 @@ var connLimitController = {
 //--------------------------------
 
 var pgdbObj = {}
-var windowtimer={}
-var iptables = { 
-    clearIP: (ip=null) => {
+var windowtimer = {}
+var windowtimer_override = {}
+var portOverrided = false
+var connstate = true
+var conndetail=""
+var connstatetimer = setInterval(() => {
+    try {
+        conndetail=exec("netstat -an|grep " + guardPort).toString()
+        connstate = true
+    } catch (e) {
+        conndetail=e.toString()
+        connstate = false
+    }
+}, 5000)
+var iptables = {
+    clearIP: (ip = null) => {
         try {
-            for (let prevRule of exec("iptables -S|grep " + guardPort +(ip?("|grep "+ip):"")).toString().split("\n")) {
+            for (let prevRule of exec("iptables -S|grep " + guardPort + (ip ? ("|grep " + ip) : "")).toString().split("\n")) {
                 if (prevRule != '') {
                     console.log("iptables: clearing previous rule: " + prevRule)
                     console.log("exec: iptables -D " + prevRule.substring(3))
@@ -43,7 +60,7 @@ var iptables = {
 
             }
         } catch (e) {
-            console.log("iptables: no previous rules "+((ip)?("for " + ip):""))
+            console.log("iptables: no previous rules " + ip ? ("for " + ip) : "")
         }
     },
     clearAll: () => {
@@ -59,6 +76,13 @@ var iptables = {
     dropIPNew: (ip) => {
         exec("iptables -I INPUT -s " + ip + " -p tcp --dport " + guardPort + " -m state --state NEW -j DROP")
     },
+    allowOverride: () => {
+        exec("iptables -I INPUT -p tcp --dport " + guardPort + " -j ACCEPT")
+    },
+    clearOverride: () => {
+        exec("iptables -D INPUT -p tcp --dport " + guardPort + " -j ACCEPT")
+        exec("iptables -I INPUT -p tcp --dport " + guardPort + " -m state --state NEW -j DROP")
+    }
 }
 
 
@@ -129,11 +153,15 @@ var server = http.createServer((req, res) => {
                     case "portauth":
                         {
                             validTokenAndAction(token, account, ip, res, () => {
+                                if (portOverrided) {
+                                    responser.errorEmitter.custom(res, "管理员已全局开启端口", 0)
+                                    return
+                                }
                                 pgdbObj.users[account].authTime = Date.now()
                                 dbOp.save()
                                 iptables.allowIP(ip)
                                 clearInterval(windowtimer[account])
-                                windowtimer[account]=setTimeout(() => {
+                                windowtimer[account] = setTimeout(() => {
                                     iptables.dropIPNew(ip)
                                     console.log("closed new connection for " + ip)
                                     pgdbObj.users[account].portstate = {
@@ -167,28 +195,53 @@ var server = http.createServer((req, res) => {
                             // })
                         }
                         break
+                    case "portoverride":
+                        validTokenAndAction(token, account, ip, res, () => {
+                            if (validAdmin(res, account)) {
+                                clearInterval(windowtimer_override)
+                                iptables.allowOverride()
+                                for (let u of Object.keys(pgdbObj.users)) {
+                                    pgdbObj.users[u].portstate = {
+                                        state: "auth_global",
+                                        optime: new Date().toString()
+                                    }
+                                }
+                                dbOp.save()
+                                portOverrided = true
+                                windowtimer_override = setTimeout(() => {
+                                    for (let u of Object.keys(pgdbObj.users)) {
+                                        pgdbObj.users[u].portstate = {
+                                            state: "auth_global_limited",
+                                            optime: new Date().toString()
+                                        }
+                                    }
+                                    dbOp.save()
+                                    iptables.clearOverride()
+                                    portOverrided = false
+                                },windowTimeout)
+                                responser.reponseJSON(res, { result: "ok" })
+                            }
+                        })
+                        break
                     case "modpass":
                         {
                             let passwordHash = obj.body.code
                             let passwordHashNew = obj.body.codenew
-                            if(!passwordHashNew){
+                            if (!passwordHashNew) {
                                 responser.errorEmitter.invalidJSONSyntax(res, 3)
                                 return
                             }
                             validTokenAndAction(token, account, ip, res, () => {
-
-                                
-
                                 try {
                                     if (pgdbObj.users[account].passwordHash != passwordHash) {
-                                        responser.errorEmitter.noSuchUser(res, 3)
+                                        responser.errorEmitter.noSuchUser(res, 2)
                                         return
                                     } else {
                                         pgdbObj.users[account].passwordHash = passwordHashNew
                                         dbOp.save()
                                     }
                                 } catch (e) {
-                                    responser.errorEmitter.noSuchUser(res, 2)
+                                    responser.errorEmitter.anonymousError(res, e)
                                     return
                                 }
                                 responser.reponseJSON(res, { result: "ok" })
@@ -212,11 +265,22 @@ var server = http.createServer((req, res) => {
                     case "userstat":
                         {
                             validTokenAndAction(token, account, ip, res, () => {
-                                responser.reponseJSON(res,{
-                                    account: account,
+                                responser.reponseJSON(res, {
                                     portstate: pgdbObj.users[account].portstate,
-                                    time: Date.now()
+                                    connstate: connstate,
+                                    conndetail: conndetail,
+                                    time: Date.now(),
+                                    isadmin: pgdbObj.admins.indexOf(account)!=-1 ? true : false
                                 })
+                            })
+                        }
+                        break
+                    case "infolist":
+                        {
+                            validTokenAndAction(token, account, ip, res, () => {
+                                if (validAdmin(res, account)) {
+                                    responser.reponseJSON(pgdbObj)
+                                }
                             })
                         }
                         break
@@ -226,11 +290,15 @@ var server = http.createServer((req, res) => {
                                 if (validAdmin(res, account)) {
                                     let accountNew = obj.body.account
                                     let passwordHashNew = obj.body.code
-                                    pgdbObj.users[accountNew]={passwordHash:''}
+                                    if (!accountNew || !passwordHashNew || accountNew == "" || passwordHashNew == "") {
+                                        responser.errorEmitter.invalidJSONSyntax(res, 3)
+                                        return
+                                    }
+                                    pgdbObj.users[accountNew] = { passwordHash: '' }
                                     pgdbObj.users[accountNew].passwordHash = passwordHashNew
                                     dbOp.save()
 
-                                    console.log(" * addeded user "+accountNew+"by"+account)
+                                    console.log(" * addeded user " + accountNew + "by" + account)
 
                                     responser.reponseJSON(res, { result: "ok" })
                                 }
@@ -242,11 +310,19 @@ var server = http.createServer((req, res) => {
                             validTokenAndAction(token, account, ip, res, () => {
                                 if (validAdmin(res, account)) {
                                     let accountExist = obj.body.account
+                                    if (!accountExist || accountExist == "") {
+                                        responser.errorEmitter.invalidJSONSyntax(res, 3)
+                                        return
+                                    }
+                                    if (pgdbObj.admins.indexOf(accountExist)!=-1) {
+                                        responser.errorEmitter.permissionDenied(res, 1)
+                                        return
+                                    }
                                     pgdbObj.users[accountExist] = {}
                                     delete pgdbObj.users[accountExist]
                                     dbOp.save()
 
-                                    console.log(" * deleted user "+accountExist+"by"+account)
+                                    console.log(" * deleted user " + accountExist + "by" + account)
                                     responser.reponseJSON(res, { result: "ok" })
                                 }
                             })
@@ -328,14 +404,14 @@ function getRemoteIP(req) {
 }
 var responser = {
     errorEmitter: {
-        invalidJSONSyntax: (res, code = 0) => {
+        invalidJSONSyntax: (res, code = 0) => { //code —— 3: 业务所需字段未提供，2: 业务类型未能匹配（协议不支持），1: 未提供业务类型，0: 非标准JSON格式
             responser.reponseJSON(res, {
                 error: "Invalid request body syntax",
                 type: 0,
                 code: code
             })
         },
-        noSuchUser: (res, code = 0) => {
+        noSuchUser: (res, code = 0) => { //code —— 0: 无此用户，1: 密码不正确，2: 修改密码时旧密码错误
             responser.reponseJSON(res, {
                 error: "User and/or password mismatch",
                 type: 1,
@@ -365,17 +441,29 @@ var responser = {
                 code: code
             })
         },
-        permissionDenied: (res, code = 0) => {
+        permissionDenied: (res, code = 0) => {// code —— 0: 非管理员用户试图使用管理员功能，1: 管理员用户试图更改其他管理员信息
             responser.reponseJSON(res, {
                 error: "Permission denied",
                 type: 5,
                 code: code
             })
+        },
+        custom: (res, text, code = 0) => {
+            responser.reponseJSON(res, {
+                error: text,
+                type: -1,
+                code: code
+            })
         }
     },
     reponseJSON(res, jsonObj) {
-        res.write(JSON.stringify(jsonObj))
-        res.end()
+        jsonObj.version = apiVersion
+        try{
+            res.write(JSON.stringify(jsonObj))
+            res.end()
+        }catch(e){
+            console.log("cancelled writing to "+ip)
+        }
     }
 }
 
@@ -397,7 +485,7 @@ var dbOp = {
     }
 }
 
-console.log("\n * PortGuardian v0.1 2022.1.24 * \n")
+console.log("\n * PortGuardian " + apiVersion + " * \n")
 dbOp.load()
 console.log("Loaded DB")
 server.listen(servicePort)
@@ -405,8 +493,3 @@ console.log("Listening on port " + servicePort)
 
 iptables.clearAll()
 iptables.dropAll()
-
-process.on('uncaughtException', function(err){
-    console.error(" * BUG: "+err.stack)
-    fs.appendFileSync("bugs.log",new Date().toString()+" "+err.stack.toString()+"\n")
-})

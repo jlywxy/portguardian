@@ -1,0 +1,8 @@
+{
+    "admins": ["user_admin"],
+    "users": {
+        "user_admin": {
+            "passwordHash": "...password in sha256 here..."
+        }
+    }
+}
